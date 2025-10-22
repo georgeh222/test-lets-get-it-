@@ -1,0 +1,620 @@
+# 🧭 Project: Picks For You (Advanced)
+
+Below is a production‑grade starter you can copy into a repo. It’s a multi‑folder Next.js (App Router) TypeScript project with a modular scoring engine, data providers, streaming updates, and a job to auto‑refresh player news/injuries. Replace provider stubs with real APIs when you’re ready.
+
+---
+
+## 📁 File Tree
+
+```
+.
+├── app
+│   ├── (marketing)
+│   │   └── page.tsx
+│   ├── dashboard
+│   │   ├── page.tsx
+│   │   └── parlay-builder
+│   │       ├── page.tsx
+│   │       └── stream.ts
+│   ├── api
+│   │   ├── generate
+│   │   │   └── route.ts
+│   │   ├── tick
+│   │   │   └── route.ts
+│   │   ├── news
+│   │   │   └── route.ts
+│   │   └── health
+│   │       └── route.ts
+│   ├── layout.tsx
+│   └── globals.css
+├── components
+│   ├── ParlayBuilder.tsx
+│   ├── LegCard.tsx
+│   ├── TeamPicker.tsx
+│   ├── LegControls.tsx
+│   ├── MiniStats.tsx
+│   └── Toaster.tsx
+├── lib
+│   ├── types.ts
+│   ├── scoring
+│   │   ├── features.ts
+│   │   ├── correlation.ts
+│   │   ├── engine.ts
+│   │   └── weights.ts
+│   ├── data
+│   │   ├── index.ts
+│   │   ├── cache.ts
+│   │   ├── map.ts
+│   │   ├── providers
+│   │   │   ├── odds.ts
+│   │   │   ├── injuries.ts
+│   │   │   ├── teams.ts
+│   │   │   ├── players.ts
+│   │   │   └── weather.ts
+│   ├── util
+│   │   ├── math.ts
+│   │   ├── time.ts
+│   │   └── strings.ts
+│   └── env.ts
+├── scripts
+│   └── refresh.ts
+├── prisma
+│   └── schema.prisma
+├── .env.example
+├── package.json
+├── next.config.mjs
+├── postcss.config.mjs
+├── tailwind.config.mjs
+└── tsconfig.json
+```
+
+---
+
+## 🔩 Key Files
+
+### package.json
+```json
+{
+  "name": "picks-for-you",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "refresh": "tsx scripts/refresh.ts"
+  },
+  "dependencies": {
+    "next": "14.2.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "framer-motion": "10.18.0",
+    "lucide-react": "0.424.0",
+    "zod": "3.23.8",
+    "zustand": "4.5.2",
+    "swr": "2.2.5",
+    "@vercel/kv": "1.0.1",
+    "@prisma/client": "5.17.0",
+    "ai": "3.2.35",
+    "eventsource-parser": "1.1.2"
+  },
+  "devDependencies": {
+    "typescript": "5.5.4",
+    "tailwindcss": "3.4.10",
+    "postcss": "8.4.47",
+    "autoprefixer": "10.4.20",
+    "prisma": "5.17.0",
+    "tsx": "4.19.0"
+  }
+}
+```
+
+### next.config.mjs
+```js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  experimental: { serverActions: { bodySizeLimit: '2mb' } },
+};
+export default nextConfig;
+```
+
+### app/layout.tsx
+```tsx
+import './globals.css';
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body className="bg-neutral-950 text-neutral-100 antialiased">{children}</body>
+    </html>
+  );
+}
+```
+
+### app/(marketing)/page.tsx
+```tsx
+import Link from 'next/link';
+export default function Marketing() {
+  return (
+    <main className="max-w-4xl mx-auto p-6">
+      <h1 className="text-4xl font-bold">Picks For You</h1>
+      <p className="text-neutral-300 mt-3">Simple UI, hard AI. Generate smart, correlated parlays for football.</p>
+      <Link href="/dashboard/parlay-builder" className="inline-block mt-6 rounded-2xl bg-neutral-100 text-neutral-900 px-4 py-2 font-medium">Try the Builder</Link>
+    </main>
+  );
+}
+```
+
+### app/dashboard/parlay-builder/page.tsx
+```tsx
+import ParlayBuilder from '@/components/ParlayBuilder';
+export default function Page() { return <ParlayBuilder/>; }
+```
+
+### app/dashboard/parlay-builder/stream.ts (Server-Sent Events)
+```ts
+import { NextRequest } from 'next/server';
+import { getRollingNews } from '@/lib/data';
+
+export const runtime = 'edge';
+export async function GET(req: NextRequest) {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      async start(controller) {
+        controller.enqueue(encoder.encode(`event: ping\ndata: start\n\n`));
+        const it = getRollingNews();
+        for await (const item of it) {
+          controller.enqueue(encoder.encode(`event: news\ndata: ${JSON.stringify(item)}\n\n`));
+        }
+      },
+    }),
+    { headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' } }
+  );
+}
+```
+
+### app/api/generate/route.ts (Parlay generation API)
+```ts
+import { NextRequest, NextResponse } from 'next/server';
+import { generateParlay } from '@/lib/scoring/engine';
+import { z } from 'zod';
+
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const schema = z.object({ teamId: z.string(), legs: z.number().min(2).max(8) });
+  const { teamId, legs } = schema.parse(body);
+  const result = await generateParlay(teamId, legs);
+  return NextResponse.json(result);
+}
+```
+
+### app/api/news/route.ts (Latest player/injury news)
+```ts
+import { NextResponse } from 'next/server';
+import { fetchInjuryNews } from '@/lib/data';
+
+export const revalidate = 0;
+export async function GET() {
+  const news = await fetchInjuryNews();
+  return NextResponse.json({ news });
+}
+```
+
+### app/api/tick/route.ts (Cron/keep-warm endpoint)
+```ts
+import { NextResponse } from 'next/server';
+import { refreshAll } from '@/lib/data';
+export async function POST() {
+  await refreshAll();
+  return NextResponse.json({ ok: true });
+}
+```
+
+### components/ParlayBuilder.tsx
+```tsx
+'use client';
+import { useEffect, useMemo, useState } from 'react';
+import { Shuffle, Sparkles } from 'lucide-react';
+import TeamPicker from './TeamPicker';
+import LegControls from './LegControls';
+import LegCard from './LegCard';
+import MiniStats from './MiniStats';
+
+export default function ParlayBuilder() {
+  const [team, setTeam] = useState('DET');
+  const [legs, setLegs] = useState(3);
+  const [seed, setSeed] = useState(0);
+  const [parlay, setParlay] = useState<any[]>([]);
+  const [news, setNews] = useState<any[]>([]);
+
+  // Generate parlay on changes
+  useEffect(() => {
+    (async () => {
+      const res = await fetch('/api/generate', { method: 'POST', body: JSON.stringify({ teamId: team, legs }), headers: { 'Content-Type': 'application/json' }});
+      const data = await res.json();
+      setParlay(data.legs);
+    })();
+  }, [team, legs, seed]);
+
+  // Stream live news/injuries via SSE
+  useEffect(() => {
+    const evt = new EventSource('/dashboard/parlay-builder/stream');
+    evt.addEventListener('news', (e: MessageEvent) => setNews(n => [JSON.parse(e.data), ...n].slice(0, 50)));
+    return () => evt.close();
+  }, []);
+
+  return (
+    <div className="max-w-5xl mx-auto p-6 space-y-6">
+      <header className="flex items-center justify-between">
+        <h1 className="text-3xl font-bold flex items-center gap-2"><Sparkles className="h-7 w-7"/>Parlay Builder</h1>
+        <button onClick={() => setSeed(s => s + 1)} className="rounded-2xl bg-neutral-900 px-3 py-2"> <Shuffle className="h-4 w-4 inline"/> Shuffle</button>
+      </header>
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <TeamPicker value={team} onChange={setTeam} />
+        <LegControls value={legs} onChange={setLegs} />
+        <MiniStats teamId={team} />
+      </div>
+
+      <section className="space-y-3">
+        {parlay.map((leg, i) => (<LegCard key={i} leg={leg}/>))}
+      </section>
+
+      <aside className="rounded-2xl bg-neutral-900 p-4 border border-neutral-800">
+        <h2 className="font-semibold mb-2">Live player updates</h2>
+        <div className="space-y-2 max-h-60 overflow-auto">
+          {news.map((n, idx) => (
+            <div key={idx} className="text-sm text-neutral-300"><b>{n.player}</b>: {n.headline} <span className="text-neutral-500">({n.when})</span></div>
+          ))}
+        </div>
+      </aside>
+
+      <footer className="text-xs text-neutral-500">For analysis/entertainment only. Not betting advice.</footer>
+    </div>
+  );
+}
+```
+
+### components/TeamPicker.tsx
+```tsx
+'use client';
+const TEAMS = [
+  { id: 'DET', name: 'Detroit Lions' },
+  { id: 'GB', name: 'Green Bay Packers' },
+  { id: 'KC', name: 'Kansas City Chiefs' },
+  { id: 'BUF', name: 'Buffalo Bills' },
+  { id: 'PHI', name: 'Philadelphia Eagles' },
+  { id: 'DAL', name: 'Dallas Cowboys' },
+  { id: 'SF', name: 'San Francisco 49ers' },
+  { id: 'MIA', name: 'Miami Dolphins' }
+];
+export default function TeamPicker({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <div className="p-4 rounded-2xl bg-neutral-900">
+      <div className="text-sm text-neutral-400">Team</div>
+      <select className="mt-1 w-full bg-neutral-800 rounded-xl p-3" value={value} onChange={e => onChange(e.target.value)}>
+        {TEAMS.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+      </select>
+    </div>
+  );
+}
+```
+
+### components/LegControls.tsx
+```tsx
+'use client';
+export default function LegControls({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  return (
+    <div className="p-4 rounded-2xl bg-neutral-900">
+      <div className="text-sm text-neutral-400">Legs</div>
+      <div className="mt-1 flex items-center gap-3">
+        <input type="range" min={2} max={8} value={value} onChange={e => onChange(parseInt(e.target.value))} className="w-full" />
+        <span className="text-lg font-semibold w-8 text-center">{value}</span>
+      </div>
+    </div>
+  );
+}
+```
+
+### components/LegCard.tsx
+```tsx
+'use client';
+export default function LegCard({ leg }: { leg: any }) {
+  return (
+    <div className="rounded-2xl bg-neutral-900 p-4 border border-neutral-800">
+      <div className="text-base md:text-lg font-semibold">{leg.title}</div>
+      <div className="text-sm text-neutral-400 mt-1">{leg.rationale}</div>
+    </div>
+  );
+}
+```
+
+### components/MiniStats.tsx
+```tsx
+'use client';
+import useSWR from 'swr';
+const fetcher = (u: string) => fetch(u).then(r => r.json());
+export default function MiniStats({ teamId }: { teamId: string }) {
+  const { data } = useSWR('/api/news', fetcher, { refreshInterval: 30_000 });
+  return (
+    <div className="p-4 rounded-2xl bg-neutral-900">
+      <div className="text-sm text-neutral-400">Matchup Snapshot</div>
+      <div className="mt-2 text-sm leading-6">
+        <div>Team: <b>{teamId}</b></div>
+        <div>Latest headlines: {(data?.news?.slice(0, 1)?.[0]?.headline) ?? '—'}</div>
+      </div>
+    </div>
+  );
+}
+```
+
+### lib/types.ts
+```ts
+export type TeamId = 'DET' | 'GB' | 'KC' | 'BUF' | 'PHI' | 'DAL' | 'SF' | 'MIA';
+export type WX = 'indoor' | 'clear' | 'windy' | 'rain' | 'snow';
+export type LegType = 'player' | 'team' | 'total';
+export type StatType = 'passYds' | 'rushYds' | 'recYds' | 'receptions' | 'rushAtt' | 'passTD' | 'rushTD' | 'recTD';
+
+export interface Team { id: TeamId; name: string; city: string; oppNext: TeamId; spread: number; total: number; paceRank: number; offEPA: number; defEPA: number; redZoneTD: number; passRate: number; rushRate: number; home: boolean; restDays: number; weather: WX; }
+export interface Player { id: string; team: TeamId; name: string; pos: 'QB'|'RB'|'WR'|'TE'; usage: number; vsPosRank: number; baseLine: Partial<Record<StatType, number>>; }
+export interface Injury { playerId: string; status: 'out'|'doubtful'|'questionable'|'probable'|'healthy'; impact: number; }
+export interface Leg { kind: LegType; title: string; rationale: string; }
+```
+
+### lib/scoring/weights.ts
+```ts
+export const WEIGHTS = {
+  injury: 0.5,
+  env: 0.6,
+  vsPos: 0.7,
+  epaTeam: 1.0,
+  correlation: 0.8,
+  lineMove: 0.6,
+  redZone: 0.4,
+  pace: 0.5,
+};
+```
+
+### lib/scoring/features.ts
+```ts
+import { Player, StatType, Team } from '@/lib/types';
+import { getInjuryByPlayer, getWeatherAdj, getVsPosAdj, getTeamNumbers } from '@/lib/data';
+import { WEIGHTS } from './weights';
+
+export function projectStat(player: Player, stat: StatType) {
+  const inj = getInjuryByPlayer(player.id);
+  const t = getTeamNumbers(player.team);
+  const env = getWeatherAdj(t, stat);
+  const vspos = getVsPosAdj(player);
+  const base = player.baseLine[stat] ?? 0;
+  const adj = WEIGHTS.injury * (inj?.impact ?? 0) + WEIGHTS.env * env + WEIGHTS.vsPos * vspos;
+  return Math.max(0, Math.round(base * (1 + adj)));
+}
+
+export function spreadEdge(team: Team) {
+  const opp = getTeamNumbers(team.oppNext);
+  const edge = (team.offEPA - opp.defEPA) - (opp.offEPA - team.defEPA) + (team.home ? 0.5 : -0.25) + (team.restDays - 6) * 0.1;
+  return edge;
+}
+```
+
+### lib/scoring/correlation.ts
+```ts
+import { Leg } from '@/lib/types';
+export function scoreParlayCorrelation(legs: Leg[]) {
+  // naive: +1 if same game and logically aligned; -1 if anti‑correlated
+  let s = 0;
+  for (const l of legs) {
+    if (l.kind === 'total' && l.title.includes('OVER')) s += 0.5;
+    if (l.kind === 'player' && /OVER/.test(l.title)) s += 0.2;
+  }
+  return s;
+}
+```
+
+### lib/scoring/engine.ts
+```ts
+import { Leg, Player, StatType, Team } from '@/lib/types';
+import { getPlayersByTeam, getTeamNumbers, getVsPosAdj } from '@/lib/data';
+import { projectStat, spreadEdge } from './features';
+import { scoreParlayCorrelation } from './correlation';
+
+export async function generateParlay(teamId: string, legs: number) {
+  const team = getTeamNumbers(teamId as any);
+  const pool = getPlayersByTeam(teamId as any);
+
+  const result: Leg[] = [];
+  // team side
+  const edge = spreadEdge(team);
+  result.push({ kind: 'team', title: `${team.city} ${team.name} ${edge >= 0 ? 'to cover' : 'opp to cover'} ${team.spread}` , rationale: `EPA + home/rest edge ${(50 + edge * 50).toFixed(0)}%`});
+  // total
+  const totSide = team.weather === 'windy' ? 'UNDER' : 'OVER';
+  result.push({ kind: 'total', title: `${totSide} ${team.total.toFixed(1)}`, rationale: `Pace/weather/efficiency mixed signal.`});
+
+  // player legs
+  const stats: StatType[] = ['recYds','receptions','rushYds','passYds','rushAtt','passTD','rushTD','recTD'];
+  for (const p of pool.sort((a: Player,b: Player)=>b.usage-a.usage)) {
+    if (result.length >= legs) break;
+    let best: { stat: StatType; val: number; delta: number } | null = null;
+    for (const s of stats) {
+      const val = projectStat(p, s);
+      const base = p.baseLine[s] ?? 0;
+      const delta = val - base;
+      if (!best || delta > best.delta) best = { stat: s, val, delta };
+    }
+    if (!best) continue;
+    const dir = best.delta >= 0 ? 'OVER' : 'UNDER';
+    result.push({ kind: 'player', title: `${p.name} ${dir} ${best.val} ${best.stat}`, rationale: `Usage ${(p.usage*100).toFixed(0)}%, vs-pos ${getVsPosAdj(p).toFixed(2)}.`});
+  }
+
+  const corr = scoreParlayCorrelation(result);
+  return { legs: result, correlationScore: corr };
+}
+```
+
+### lib/data/index.ts (barrel + helpers)
+```ts
+export * from './providers/odds';
+export * from './providers/injuries';
+export * from './providers/teams';
+export * from './providers/players';
+export * from './providers/weather';
+export * from './cache';
+export * from './map';
+```
+
+### lib/data/cache.ts (KV cache)
+```ts
+import { kv } from '@vercel/kv';
+export async function cacheGet<T>(k: string): Promise<T | null> { try { return (await kv.get(k)) as any; } catch { return null; } }
+export async function cacheSet<T>(k: string, v: T, ttlSec = 60) { try { await kv.set(k, v, { ex: ttlSec }); } catch {} }
+```
+
+### lib/data/map.ts (provider fusion)
+```ts
+import { Team, TeamId, Player } from '@/lib/types';
+import { getOdds, getTeams, getPlayers, getInjuries, getWeather } from './index';
+
+export function getTeamNumbers(id: TeamId): Team {
+  const t = getTeams().find(t => t.id === id)!;
+  return t;
+}
+export function getPlayersByTeam(id: TeamId): Player[] {
+  return getPlayers().filter(p => p.team === id);
+}
+export function getInjuryByPlayer(pid: string) {
+  return getInjuries().find(i => i.playerId === pid);
+}
+export function getWeatherAdj(team: Team, stat: any) {
+  const wx = team.weather;
+  let adj = 0; if (wx === 'windy' && /(pass|rec)/.test(String(stat))) adj -= 0.08; if (wx==='rain'||wx==='snow') adj -= 0.05; if (wx==='indoor') adj += 0.05; if (team.home) adj += 0.03; return adj;
+}
+export function getVsPosAdj(p: Player) { return (16 - p.vsPosRank) / 80; }
+
+// Live news streaming iterator (mock → replace with provider)
+export async function* getRollingNews() {
+  let i = 0; const arr = [
+    { player: 'A. St. Brown', headline: 'Limited at practice, trending up', when: 'now' },
+    { player: 'T. Kelce', headline: 'Full participant', when: '2m' },
+    { player: 'J. Love', headline: 'Questionable—ankle', when: '5m' },
+  ];
+  while (true) { yield arr[i % arr.length]; i++; await new Promise(r => setTimeout(r, 4000)); }
+}
+
+export async function fetchInjuryNews() { return [ { player: 'C. McCaffrey', headline: 'Probable; no setback' } ]; }
+export async function refreshAll() { await Promise.resolve(); }
+```
+
+### lib/data/providers/odds.ts (stub)
+```ts
+export function getOdds() { return { }; }
+```
+
+### lib/data/providers/injuries.ts (stub data)
+```ts
+import { Injury } from '@/lib/types';
+export function getInjuries(): Injury[] {
+  return [
+    { playerId: 'stbrown', status: 'probable', impact: 0.2 },
+    { playerId: 'love', status: 'questionable', impact: -0.6 },
+  ];
+}
+```
+
+### lib/data/providers/teams.ts (stub data)
+```ts
+import { Team } from '@/lib/types';
+export function getTeams(): Team[] {
+  return [
+    { id: 'DET', name: 'Lions', city: 'Detroit', oppNext: 'GB', spread: -3.5, total: 47.5, paceRank: 10, offEPA: 0.12, defEPA: -0.04, redZoneTD: 0.62, passRate: 0.56, rushRate: 0.44, home: true, restDays: 7, weather: 'indoor' },
+    { id: 'GB', name: 'Packers', city: 'Green Bay', oppNext: 'DET', spread: 3.5, total: 47.5, paceRank: 18, offEPA: 0.05, defEPA: 0.02, redZoneTD: 0.55, passRate: 0.58, rushRate: 0.42, home: false, restDays: 7, weather: 'clear' },
+  ] as any;
+}
+```
+
+### lib/data/providers/players.ts (stub data)
+```ts
+import { Player } from '@/lib/types';
+export function getPlayers(): Player[] {
+  return [
+    { id: 'gibbs', team: 'DET', name: 'J. Gibbs', pos: 'RB', usage: 0.64, vsPosRank: 8, baseLine: { rushYds: 64, recYds: 28, rushAtt: 15, recTD: 0.2 } },
+    { id: 'stbrown', team: 'DET', name: 'A. St. Brown', pos: 'WR', usage: 0.30, vsPosRank: 10, baseLine: { recYds: 86, receptions: 7.1, recTD: 0.45 } },
+    { id: 'love', team: 'GB', name: 'J. Love', pos: 'QB', usage: 1.00, vsPosRank: 20, baseLine: { passYds: 246, passTD: 1.7 } },
+  ];
+}
+```
+
+### lib/data/providers/weather.ts (stub)
+```ts
+export function getWeather() { return {}; }
+```
+
+### lib/util/math.ts
+```ts
+export const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
+```
+
+### lib/util/time.ts
+```ts
+export const nowIso = () => new Date().toISOString();
+```
+
+### lib/util/strings.ts
+```ts
+export const pct = (x: number) => `${Math.round(x * 100)}%`;
+```
+
+### scripts/refresh.ts (local cron job)
+```ts
+import { refreshAll } from '@/lib/data';
+(async () => { await refreshAll(); console.log('Refreshed.'); })();
+```
+
+### prisma/schema.prisma (optional DB for logs/settings)
+```prisma
+generator client { provider = "prisma-client-js" }
+datasource db { provider = "sqlite" url = "file:./dev.db" }
+model NewsLog { id Int @id @default(autoincrement()) player String headline String createdAt DateTime @default(now()) }
+```
+
+### .env.example
+```
+REDIS_URL=
+PROVIDER_ODDS_KEY=
+PROVIDER_NEWS_KEY=
+PROVIDER_WEATHER_KEY=
+```
+
+### tailwind.config.mjs
+```js
+/** @type {import('tailwindcss').Config} */
+export default { content: ['./app/**/*.{ts,tsx}','./components/**/*.{ts,tsx}'], theme: { extend: {} }, plugins: [] }
+```
+
+---
+
+## 🧠 How real‑time updates work
+- **/dashboard/parlay-builder/stream** uses **SSE** to push incoming “news” events to the client without refresh.
+- **/api/news** returns the latest injury headlines for polling and tiny UI summaries.
+- **/api/tick** lets a cron (Vercel/Render/CRON) trigger `refreshAll()` to pull odds/injuries/weather, write to KV/DB, and warm caches.
+
+## 🔌 Replace stubs with real providers
+- `lib/data/providers/*.ts` expose small, predictable shapes so you can swap in The Odds API, SportsDataIO, Sportradar, PFF, or your own scraper.
+- Keep the **fusion layer** (`map.ts`) stable so the scoring engine doesn’t care which vendor you use.
+
+## 🧮 Scoring philosophy (simple UI, hard AI)
+- Feature building lives in `lib/scoring/features.ts` with weights in `weights.ts`.
+- Add signals: line movement, implied totals, PROE, success rate, explosive plays, red‑zone, OL pressure vs DL pressure, aDOT, YAC, missed tackles, rest/travel.
+- **Correlation**: stack legs that logically move together; down‑weight anti‑correlated combos.
+
+## ⚠️ Compliance
+- Keep “for entertainment only” and avoid showing book odds unless permitted.
+
+---
+
+## ➕ Next steps
+- Hook up a real injuries/news API and odds feed.
+- Add a weight‑tuning admin UI with sliders + backtests.
+- Persist generated slips and user tweaks for learning.
+
+```diff
++ Simple UI for George; complex under the hood for the model.
