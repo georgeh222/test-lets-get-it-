@@ -618,3 +618,231 @@ export default { content: ['./app/**/*.{ts,tsx}','./components/**/*.{ts,tsx}'], 
 
 ```diff
 + Simple UI for George; complex under the hood for the model.
+
+
+---
+
+## 🔌 Live adapters (plug into real APIs)
+
+> Drop these in to replace the stubs. They include typed fetchers, retry, and env-driven keys. They return clean, normalized objects that the scoring engine already understands. (Keep the fusion layer in `lib/data/map.ts`.)
+
+### lib/env.ts
+```ts
+export const env = {
+  ODDS_KEY: process.env.PROVIDER_ODDS_KEY!,
+  SDIO_KEY: process.env.PROVIDER_SDIO_KEY!, // SportsDataIO
+  WX_KEY: process.env.PROVIDER_WEATHER_KEY!, // Visual Crossing or similar
+};
+```
+
+### lib/data/providers/odds.ts (The Odds API-style)
+```ts
+import { cacheGet, cacheSet } from '@/lib/data/cache';
+import { env } from '@/lib/env';
+
+type OddsGame = { home_team: string; away_team: string; bookmakers: any[]; commence_time: string };
+
+export async function getOdds() {
+  const cache = await cacheGet<any>('odds:NFL');
+  if (cache) return cache;
+  const url = `https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds?markets=h2h,spreads,totals&regions=us&oddsFormat=american&apiKey=${env.ODDS_KEY}`;
+  const res = await fetch(url, { next: { revalidate: 60 } });
+  if (!res.ok) throw new Error('odds fetch failed');
+  const data: OddsGame[] = await res.json();
+  await cacheSet('odds:NFL', data, 55);
+  return data;
+}
+```
+
+### lib/data/providers/injuries.ts (SportsDataIO-style)
+```ts
+import { cacheGet, cacheSet } from '@/lib/data/cache';
+import { env } from '@/lib/env';
+import type { Injury } from '@/lib/types';
+
+type SDInjury = { PlayerID: number; Name: string; Team: string; Position: string; Status: string };
+
+export async function getInjuries(): Promise<Injury[]> {
+  const k = 'injuries:NFL';
+  const cache = await cacheGet<Injury[]>(k);
+  if (cache) return cache;
+  const url = `https://api.sportsdata.io/v3/nfl/scores/json/Injuries/2025REG?key=${env.SDIO_KEY}`;
+  const res = await fetch(url, { next: { revalidate: 120 } });
+  if (!res.ok) throw new Error('injuries fetch failed');
+  const rows: SDInjury[] = await res.json();
+  const mapped: Injury[] = rows.slice(0, 200).map(r => ({
+    playerId: String(r.PlayerID),
+    status: toStatus(r.Status),
+    impact: toImpact(r.Status)
+  }));
+  await cacheSet(k, mapped, 110);
+  return mapped;
+}
+function toStatus(s: string): Injury['status'] {
+  const t = s?.toLowerCase();
+  if (t?.includes('out')) return 'out';
+  if (t?.includes('doubt')) return 'doubtful';
+  if (t?.includes('quest')) return 'questionable';
+  if (t?.includes('prob')) return 'probable';
+  return 'healthy';
+}
+function toImpact(s: string) {
+  if (/out/i.test(s)) return -1.8; if (/doubt/i.test(s)) return -1.0; if (/quest/i.test(s)) return -0.5; if (/prob/i.test(s)) return 0.2; return 0;
+}
+```
+
+### lib/data/providers/weather.ts (Visual Crossing-style)
+```ts
+import { cacheGet, cacheSet } from '@/lib/data/cache';
+import { env } from '@/lib/env';
+
+type Wx = { windspeed: number; temp: number; preciptype?: string[] };
+
+export async function getWeatherForStadium(stadium: string, isoDate: string): Promise<Wx> {
+  const key = `wx:${stadium}:${isoDate.slice(0,10)}`;
+  const cache = await cacheGet<Wx>(key); if (cache) return cache;
+  const loc = encodeURIComponent(stadium);
+  const url = `https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services/timeline/${loc}/${isoDate.slice(0,10)}?key=${env.WX_KEY}&include=days&unitGroup=us`;
+  const res = await fetch(url, { next: { revalidate: 180 } });
+  if (!res.ok) throw new Error('weather fetch failed');
+  const data = await res.json();
+  const d = data.days?.[0] ?? {};
+  const wx: Wx = { windspeed: d.windspeed ?? 0, temp: d.temp ?? 70, preciptype: d.preciptype };
+  await cacheSet(key, wx, 170);
+  return wx;
+}
+```
+
+### app/api/slips/route.ts (save & list slips)
+```ts
+import { NextRequest, NextResponse } from 'next/server';
+import { prisma } from '@/server/prisma';
+
+export async function GET() {
+  const slips = await prisma.slip.findMany({ orderBy: { createdAt: 'desc' }, take: 50, include: { legs: true } });
+  return NextResponse.json({ slips });
+}
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const { teamId, legs } = body as { teamId: string; legs: { kind: string; title: string; rationale: string }[] };
+  const slip = await prisma.slip.create({ data: { teamId, legs: { createMany: { data: legs } } } });
+  return NextResponse.json({ ok: true, id: slip.id });
+}
+```
+
+### components/SaveSlip.tsx
+```tsx
+'use client';
+export default function SaveSlip({ teamId, legs }: { teamId: string; legs: any[] }) {
+  async function save() {
+    await fetch('/api/slips', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ teamId, legs }) });
+    alert('Saved');
+  }
+  return <button onClick={save} className="rounded-2xl bg-neutral-100 text-neutral-900 px-3 py-2">Save slip</button>;
+}
+```
+
+### prisma/schema.prisma (expanded for users/slips/backtests)
+```prisma
+generator client { provider = "prisma-client-js" }
+datasource db { provider = "postgresql" url = env("DATABASE_URL") }
+model User { id String @id @default(cuid()) email String @unique createdAt DateTime @default(now()) slips Slip[] }
+model Slip { id String @id @default(cuid()) teamId String createdAt DateTime @default(now()) legs Leg[] correlationScore Float? notes String? }
+model Leg { id String @id @default(cuid()) slipId String slip Slip @relation(fields:[slipId], references:[id]) kind String title String rationale String }
+model BacktestRun { id String @id @default(cuid()) createdAt DateTime @default(now()) name String results Json }
+```
+
+### server/prisma.ts
+```ts
+import { PrismaClient } from '@prisma/client';
+export const prisma = globalThis.prisma || new PrismaClient();
+if (process.env.NODE_ENV !== 'production') (globalThis as any).prisma = prisma;
+```
+
+### app/dashboard/parlay-builder/page.tsx (wire SaveSlip button)
+```tsx
+import ParlayBuilder from '@/components/ParlayBuilder';
+export default function Page() { return <ParlayBuilder />; }
+```
+
+### components/ParlayBuilder.tsx (add SaveSlip + news banner)
+```tsx
+// ...existing imports
+import SaveSlip from './SaveSlip';
+// inside component render, after parlay list
+<div className="flex items-center justify-between mt-4">
+  <div className="text-sm text-neutral-400">Correlation score updates live as you tweak legs.</div>
+  <SaveSlip teamId={team} legs={parlay} />
+</div>
+```
+
+### app/api/generate/route.ts (return correlationScore too)
+```ts
+// replace return with:
+return NextResponse.json({ legs: result.legs, correlationScore: result.correlationScore });
+```
+
+### Backtesting scaffold
+
+#### app/api/backtest/route.ts
+```ts
+import { NextRequest, NextResponse } from 'next/server';
+import { prisma } from '@/server/prisma';
+import { generateParlay } from '@/lib/scoring/engine';
+
+export async function POST(req: NextRequest) {
+  const body = await req.json();
+  const { teamIds } = body as { teamIds: string[] };
+  const runs = await Promise.all(teamIds.map(t => generateParlay(t, 3)));
+  const saved = await prisma.backtestRun.create({ data: { name: `quick-${Date.now()}`, results: runs as any } });
+  return NextResponse.json({ id: saved.id });
+}
+```
+
+#### app/dashboard/admin/page.tsx (weight tuning UI – minimal)
+```tsx
+'use client';
+import { useState } from 'react';
+const KEYS = ['injury','env','vsPos','epaTeam','correlation','lineMove','redZone','pace'] as const;
+export default function Admin() {
+  const [weights, setWeights] = useState<Record<string, number>>({ injury:0.5, env:0.6, vsPos:0.7, epaTeam:1, correlation:0.8, lineMove:0.6, redZone:0.4, pace:0.5 });
+  return (
+    <main className="max-w-3xl mx-auto p-6 space-y-4">
+      <h1 className="text-2xl font-bold">Model Weights</h1>
+      {KEYS.map(k => (
+        <div key={k} className="flex items-center gap-4">
+          <div className="w-32">{k}</div>
+          <input type="range" min={0} max={2} step={0.05} value={weights[k]} onChange={e => setWeights({ ...weights, [k]: parseFloat(e.target.value) })} className="flex-1"/>
+          <div className="w-12 text-right">{weights[k].toFixed(2)}</div>
+        </div>
+      ))}
+      <p className="text-sm text-neutral-400">Persisting weights to a DB or KV is trivial—call an API to save & reload on startup.</p>
+    </main>
+  );
+}
+```
+
+### Cron / scheduler
+- Call `POST /api/tick` every minute (or 2–5 min) to refresh odds/injuries/weather into KV.
+- Vercel example: Settings → Cron → `/api/tick` @ */2 * * * *
+
+### .env.example (expand)
+```
+REDIS_URL=
+DATABASE_URL=postgresql://user:pass@host:5432/pfy
+PROVIDER_ODDS_KEY=
+PROVIDER_SDIO_KEY=
+PROVIDER_WEATHER_KEY=
+```
+
+---
+
+## 🧠 Extra product ideas (you said “yes” to wiring it up)
+- **Auto-news regeneration**: if a key player’s status flips (Q→O), auto re-run `/api/generate` and highlight affected legs.
+- **Steam detector**: compute open→current deltas from odds feed; warn on > 1.5 pt move or total shift > 2.0.
+- **Opponent spillover**: if your team stack is saturated, suggest 1 “bring-back” leg from the opponent WR/RB based on coverage funnel.
+- **User presets**: sliders for risk (2–5 legs), prefer yardage vs TD props, prefer star vs value plays.
+- **Explainability**: expandable card with the exact feature contributions per leg (+0.12 injury, -0.05 wind, etc.).
+- **Audit trail**: store input features + output legs in `Slip` for post-game review/backtesting.
+
+> You can now paste these files over the previous canvas project and you’ll have: saving slips, admin weight tuning, real-provider adapters, SSE live updates, and a backtesting endpoint scaffold.
